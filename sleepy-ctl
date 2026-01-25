@@ -1,0 +1,23 @@
+#!/bin/bash
+# Sleepy Linux - Control Script
+
+# === CONFIG (Patched by install.sh) ===
+TARGET_IP="REPLACE_IP"
+WOL="REPLACE_WOL"
+
+INSTALL_PATH="/opt/sleepy-linux"
+CMD="$INSTALL_PATH/venv/bin/bscpylgtvcommand -p $INSTALL_PATH/.aiopylgtv.sqlite $TARGET_IP"
+
+log() { logger -t "sleepy-linux" "$1"; echo "$1"; }
+
+case "$1" in
+    ON)
+        log "Waking up: $WOL"
+        $WOL
+        ;;
+        
+    OFF)
+        log "Going to sleep..."
+        $CMD power_off
+        ;;
+esac

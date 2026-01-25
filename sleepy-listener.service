@@ -1,0 +1,11 @@
+[Unit]
+Description=Sleepy Linux Listener (TV & RGB)
+After=graphical-session.target
+
+[Service]
+ExecStart=EXEC_PATH
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
