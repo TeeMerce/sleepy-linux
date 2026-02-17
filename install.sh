@@ -1,5 +1,5 @@
 #!/bin/bash
-# Sleepy Linux - Installer (Python Edition)
+# Sleepy Linux - Installer (Server Edition)
 # Usage: ./install.sh <TV_IP_ADDRESS>
 
 set -e
@@ -28,17 +28,16 @@ if [[ $EUID -eq 0 ]]; then
    exit 1
 fi
 
-echo -e "${BLUE}=== Installing Sleepy Linux (Python Edition) ===${NC}"
+echo -e "${BLUE}=== Installing Sleepy Linux (Server Edition) ===${NC}"
 
-# 1. Install Dependencies (Arch/CachyOS)
+# 1. Install Dependencies
 if command -v pacman &> /dev/null; then
     echo -e "${BLUE}Checking system dependencies...${NC}"
-    # python-gobject is required for the listener
+    # python-gobject is required for the listener (System Package)
     if ! pacman -Qi python-gobject >/dev/null 2>&1; then
         echo "Installing python-gobject..."
         sudo pacman -S --noconfirm --needed python-gobject
     fi
-    # wakeonlan
     if ! command -v wakeonlan &> /dev/null; then
         echo "Installing wakeonlan..."
         sudo pacman -S --noconfirm --needed wakeonlan
@@ -50,12 +49,13 @@ sudo rm -rf "$INSTALL_PATH"
 sudo mkdir -p "$INSTALL_PATH"
 sudo chown "$USER:$USER" "$INSTALL_PATH"
 
-# 3. Python VENV (for bscpylgtv)
-echo -e "${BLUE}Installing bscpylgtv...${NC}"
-python3 -m venv "$INSTALL_PATH/venv"
-"$INSTALL_PATH/venv/bin/pip" install --upgrade pip bscpylgtv >/dev/null 2>&1
+# 3. Python VENV (bscpylgtv + openrgb-python)
+echo -e "${BLUE}Installing Python libraries...${NC}"
+# CRITICAL: --system-site-packages allows us to see 'gi' (GTK) from system
+python3 -m venv --system-site-packages "$INSTALL_PATH/venv"
+"$INSTALL_PATH/venv/bin/pip" install --upgrade pip bscpylgtv openrgb-python >/dev/null 2>&1
 
-# 4. Install Control Script (sleepy-ctl)
+# 4. Install Control Script
 echo -e "${BLUE}Installing sleepy-ctl...${NC}"
 cp sleepy-ctl "$INSTALL_PATH/sleepy-ctl"
 WOL_CMD="/usr/bin/wakeonlan -i $TV_IP $MAC"
@@ -64,13 +64,15 @@ sed -i "s|REPLACE_WOL|$WOL_CMD|g" "$INSTALL_PATH/sleepy-ctl"
 chmod +x "$INSTALL_PATH/sleepy-ctl"
 sudo ln -sf "$INSTALL_PATH/sleepy-ctl" /usr/local/bin/sleepy-ctl
 
-# 5. Install Python Listener (sleepy-listener.py)
+# 5. Install Listener
 echo -e "${BLUE}Installing Python listener...${NC}"
 cp sleepy-listener.py "$INSTALL_PATH/sleepy-listener.py"
+# CRITICAL: Patch the shebang to use our VENV python explicitly
+sed -i "1s|^.*$|#!$INSTALL_PATH/venv/bin/python3|" "$INSTALL_PATH/sleepy-listener.py"
 chmod +x "$INSTALL_PATH/sleepy-listener.py"
 
-# 6. System Services (Boot/Shutdown)
-echo -e "${BLUE}Configuring Boot/Shutdown services...${NC}"
+# 6. System Services
+echo -e "${BLUE}Configuring Services...${NC}"
 TEMP_DIR=$(mktemp -d)
 sed "s|PWR_OFF_CMD|$INSTALL_PATH/sleepy-ctl OFF|g" sleepy-shutdown.service > "$TEMP_DIR/sleepy-shutdown.service"
 sed "s|PWR_ON_CMD|$INSTALL_PATH/sleepy-ctl ON|g" sleepy-boot.service > "$TEMP_DIR/sleepy-boot.service"
@@ -81,8 +83,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable sleepy-boot.service sleepy-shutdown.service
 rm -rf "$TEMP_DIR"
 
-# 7. User Service (The Listener)
-echo -e "${BLUE}Configuring User Listener Service...${NC}"
+# 7. User Service
 mkdir -p "$USER_SERVICE_PATH"
 cp sleepy-listener.service "$USER_SERVICE_PATH/"
 sed -i "s|EXEC_PATH|$INSTALL_PATH/sleepy-listener.py|g" "$USER_SERVICE_PATH/sleepy-listener.service"
@@ -99,4 +100,4 @@ read -p "Press Enter..."
 "$INSTALL_PATH/venv/bin/bscpylgtvcommand" -p "$INSTALL_PATH/.aiopylgtv.sqlite" "$TV_IP" button INFO >/dev/null 2>&1 || true
 
 echo
-echo -e "${GREEN}Sleepy Linux Installed! 💤${NC}"
+echo -e "${GREEN}Done! Ensure OpenRGB Server is running.${NC}"
