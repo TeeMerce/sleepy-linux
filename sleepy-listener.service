@@ -1,11 +1,13 @@
 [Unit]
-Description=Sleepy Linux Listener (TV & RGB)
+Description=sleepy - TV + RGB screen-lock companion
 After=graphical-session.target
+Wants=graphical-session.target
 
 [Service]
-ExecStart=EXEC_PATH
-Restart=always
+Type=simple
+ExecStart=%h/.local/share/sleepy/venv/bin/python %h/.local/share/sleepy/sleepy-listener.py
+Restart=on-failure
 RestartSec=5
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

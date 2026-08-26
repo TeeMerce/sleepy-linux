@@ -1,111 +1,163 @@
 #!/usr/bin/env python3
-import gi
-import subprocess
-import shutil
-import time
-import sys
-# Import the OpenRGB client library
-from openrgb import OpenRGBClient
+"""sleepy-listener.py — v3
 
-gi.require_version('Gio', '2.0')
+Watches GNOME's screen-lock state AND monitor power state, drives TV + RGB:
+
+  ScreenSaver locked             -> off   (TV off + RGB off)
+  ScreenSaver unlocked           -> on    (TV on  + RGB on)
+  Monitor wake  (PowerSave=0)    -> on    (mouse/keyboard -> show lock screen)
+  Monitor sleep (PowerSave=1)
+      + still locked after GUARD -> off   (re-switch off if not logged in)
+      + unlocked                 -> ignore
+
+- Event-driven (D-Bus signals), no polling.
+- Lock state via org.gnome.ScreenSaver.GetActive() (method, not the
+  IsLocked property — that doesn't exist on modern GNOME).
+- One-shot `openrgb --profile` (no background server needed).
+- TV on/off via sleepy-ctl (WOL + bscpylgtv power_off).
+- Never acts on the initial lock state.
+"""
+import os
+import subprocess
+import sys
+
+import gi
+gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib
 
-# --- CONFIGURATION ---
-PATH_CTL = "/opt/sleepy-linux/sleepy-ctl"
-CMD_TV_ON = [PATH_CTL, "ON"]
-CMD_TV_OFF = [PATH_CTL, "OFF"]
+INSTALL_PATH = os.path.expanduser(os.environ.get("SLEEPY_HOME", "~/.local/share/sleepy"))
+CTL = os.path.join(INSTALL_PATH, "sleepy-ctl")
+CONF = os.path.join(INSTALL_PATH, "sleepy.conf")
 
-# --- STATE TRACKING ---
-is_locked = False 
 
-def run_bg(cmd_list):
+def load_conf():
+    cfg = {"GUARD_SECONDS": 4.0}
     try:
-        if cmd_list[0] and shutil.which(cmd_list[0]):
-            subprocess.Popen(cmd_list, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as e:
-        print(f"Error running {cmd_list}: {e}")
-
-def set_rgb_profile(profile_name):
-    """Connects to OpenRGB Server and sets profile silently"""
-    try:
-        client = OpenRGBClient() # Connects to localhost:6742 by default
-        client.load_profile(profile_name)
-        print(f"RGB: Loaded profile '{profile_name}'")
-    except Exception as e:
-        # If server is not running, we fail silently to avoid crashing the whole listener
-        print(f"RGB Error (Is OpenRGB Server running?): {e}")
-
-def trigger_wake():
-    print("ACTION: Wake -> TV ON + RGB ON")
-    run_bg(CMD_TV_ON)
-    set_rgb_profile("On")
-
-def trigger_sleep():
-    print("ACTION: Sleep -> TV OFF + RGB OFF")
-    run_bg(CMD_TV_OFF)
-    set_rgb_profile("Off")
-
-def check_sleep_guard():
-    global is_locked
-    if is_locked:
-        print(f"GUARD: Still Locked after 4s -> Executing Sleep")
-        trigger_sleep()
-    else:
-        print(f"GUARD: System is Unlocked -> Ignoring Sleep Signal")
-    return False
-
-def on_signal(connection, sender_name, object_path, interface_name, signal_name, parameters, user_data):
-    global is_locked
-    try:
-        if signal_name == "ActiveChanged" and interface_name == "org.gnome.ScreenSaver":
-            is_locked = parameters.unpack()[0]
-            if is_locked:
-                print("SIGNAL: Screen Locked")
-                trigger_sleep()
-            else:
-                print("SIGNAL: Screen Unlocked")
-                trigger_wake()
-
-        elif signal_name == "PropertiesChanged" and interface_name == "org.freedesktop.DBus.Properties":
-            iface, changed_props, _ = parameters.unpack()
-            if iface == "org.gnome.Mutter.DisplayConfig" and "PowerSaveMode" in changed_props:
-                power_mode = changed_props["PowerSaveMode"]
-                if power_mode == 0:
-                    print("SIGNAL: Monitor Wake")
-                    trigger_wake()
-                elif is_locked:
-                    print("SIGNAL: Monitor Sleep (While Locked) -> Starting 4s Guard...")
-                    GLib.timeout_add_seconds(4, check_sleep_guard)
+        with open(CONF) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k in cfg:
+                    try:
+                        cfg[k] = float(v)
+                    except ValueError:
+                        pass
                 else:
-                    print("SIGNAL: Monitor Sleep (While Unlocked) -> Ignored")
-    except Exception as e:
-        print(f"Signal Error: {e}")
-
-def get_initial_state(connection):
-    global is_locked
-    try:
-        result = connection.call_sync(
-            "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver",
-            "GetActive", None, GLib.VariantType("(b)"), Gio.DBusCallFlags.NONE, -1, None
-        )
-        is_locked = result.unpack()[0]
-        print(f"STARTUP: Initial state is {'LOCKED' if is_locked else 'UNLOCKED'}")
-    except Exception:
+                    cfg[k] = v
+    except FileNotFoundError:
         pass
+    return cfg
+
+
+def ensure_dbus():
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        if xdg:
+            os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={xdg}/bus"
+
+
+def run_ctl(action):
+    try:
+        subprocess.run([CTL, action], timeout=90,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[sleepy] -> {action}", flush=True)
+    except Exception as e:
+        print(f"[sleepy] {action} failed: {e}", flush=True)
+
+
+class Sleepy:
+    def __init__(self, bus, cfg):
+        self.bus = bus
+        self.cfg = cfg
+        self.locked = False
+
+    def get_locked(self):
+        try:
+            res = self.bus.call_sync(
+                "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver",
+                "org.gnome.ScreenSaver", "GetActive",
+                None, GLib.VariantType("(b)"),
+                Gio.DBusCallFlags.NONE, -1, None,
+            )
+            return bool(res.unpack()[0])
+        except Exception:
+            return None
+
+    def set_locked(self, locked):
+        if locked == self.locked:
+            return
+        self.locked = locked
+        print(f"[sleepy] ScreenSaver {'locked' if locked else 'unlocked'}", flush=True)
+        run_ctl("off" if locked else "on")
+
+    def on_power_save(self, mode):
+        if mode == 0:
+            print("[sleepy] Monitor wake -> on", flush=True)
+            run_ctl("on")
+        elif self.locked:
+            print("[sleepy] Monitor sleep (locked) -> guard", flush=True)
+            GLib.timeout_add_seconds(int(self.cfg["GUARD_SECONDS"]), self.check_guard)
+        else:
+            print("[sleepy] Monitor sleep (unlocked) -> ignored", flush=True)
+
+    def check_guard(self):
+        if self.locked:
+            print("[sleepy] Guard: still locked -> off", flush=True)
+            run_ctl("off")
+        else:
+            print("[sleepy] Guard: unlocked -> ignored", flush=True)
+        return False  # one-shot
+
+    def on_saver(self, *args):
+        try:
+            connection, sender, obj_path, iface, sig, params, user_data = args
+            if sig == "ActiveChanged" and iface == "org.gnome.ScreenSaver":
+                self.set_locked(params.unpack()[0])
+        except Exception as e:
+            print(f"[sleepy] saver error: {e}", flush=True)
+
+    def on_props(self, *args):
+        try:
+            connection, sender, obj_path, iface, sig, params, user_data = args
+            if sig == "PropertiesChanged" and iface == "org.freedesktop.DBus.Properties":
+                prop_iface, changed, _ = params.unpack()
+                if prop_iface == "org.gnome.Mutter.DisplayConfig" and "PowerSaveMode" in changed:
+                    self.on_power_save(changed["PowerSaveMode"])
+        except Exception as e:
+            print(f"[sleepy] props error: {e}", flush=True)
+
+    def start(self):
+        initial = self.get_locked()
+        if initial is None:
+            print("[sleepy] FATAL: cannot read lock state "
+                  "(org.gnome.ScreenSaver missing?)", flush=True)
+            sys.exit(1)
+        self.locked = initial  # baseline — never act on it
+        print(f"[sleepy] v3 started (initial={'locked' if initial else 'unlocked'}, "
+              f"guard={self.cfg['GUARD_SECONDS']}s)", flush=True)
+
+        self.bus.signal_subscribe(
+            None, "org.gnome.ScreenSaver", "ActiveChanged",
+            "/org/gnome/ScreenSaver", None, Gio.DBusSignalFlags.NONE,
+            self.on_saver, None,
+        )
+        self.bus.signal_subscribe(
+            None, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+            "/org/gnome/Mutter/DisplayConfig", None, Gio.DBusSignalFlags.NONE,
+            self.on_props, None,
+        )
+
 
 def main():
-    connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-    get_initial_state(connection)
+    ensure_dbus()
+    cfg = load_conf()
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    Sleepy(bus, cfg).start()
+    GLib.MainLoop().run()
 
-    connection.signal_subscribe(None, "org.gnome.ScreenSaver", "ActiveChanged", "/org/gnome/ScreenSaver", None, Gio.DBusSignalFlags.NONE, on_signal, None)
-    connection.signal_subscribe(None, "org.freedesktop.DBus.Properties", "PropertiesChanged", "/org/gnome/Mutter/DisplayConfig", None, Gio.DBusSignalFlags.NONE, on_signal, None)
-
-    print("Sleepy Linux Listener (Server Edition) Running...")
-    loop = GLib.MainLoop()
-    try:
-        loop.run()
-    except KeyboardInterrupt:
-        pass
 
 if __name__ == "__main__":
     main()

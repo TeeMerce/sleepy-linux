@@ -1,6 +1,6 @@
 [Unit]
-Description=sleepy - TV + RGB off on shutdown
-Before=shutdown.target
+Description=sleepy - TV + RGB off on suspend/hibernate
+Before=sleep.target
 After=network.target
 DefaultDependencies=no
 
@@ -11,4 +11,4 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/tom/.local/share/sleepy/sleepy-ctl off
 
 [Install]
-WantedBy=shutdown.target
+WantedBy=sleep.target

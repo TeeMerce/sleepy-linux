@@ -1,11 +1,13 @@
 [Unit]
-Description=Sleepy Linux - Boot Wake
-After=network-online.target
-Wants=network-online.target
+Description=sleepy - TV + RGB on at boot
+After=network.target
+Wants=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c "PWR_ON_CMD"
+Environment=SLEEPY_HOME=/home/tom/.local/share/sleepy
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/tom/.local/share/sleepy/sleepy-ctl on
 
 [Install]
 WantedBy=multi-user.target
