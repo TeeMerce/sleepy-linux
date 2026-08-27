@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""sleepy ctl — v3
+"""sleepy ctl — v3.2
 
   sleepy-ctl on          TV on (WOL) + RGB on   [RGB runs in parallel with WOL]
   sleepy-ctl off         RGB off + TV off (webOS power_off, 1 retry)
   sleepy-ctl rgb on|off  RGB only
   sleepy-ctl test        static checks + live ON -> OFF cycle
   sleepy-ctl detect      print resolved config
+
+v3.2: sleepy.conf parser strips inline comments; TV_IP is validated so a
+      malformed value warns instead of crashing WOL / breaking power_off.
 """
 import argparse
 import os
@@ -30,8 +33,8 @@ def load_conf():
     try:
         with open(CONF) as fh:
             for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
+                line = line.split("#", 1)[0].strip()   # drop inline + full-line comments
+                if not line or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
                 cfg[k.strip()] = v.strip().strip('"').strip("'")
@@ -40,25 +43,36 @@ def load_conf():
     return cfg
 
 
+def valid_ip(ip):
+    parts = (ip or "").split(".")
+    return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+
+
 def openrgb_bin(cfg):
     return shutil.which(cfg.get("OPENRGB_BIN", "openrgb")) or cfg.get("OPENRGB_BIN", "openrgb")
 
 
 def broadcast_ip(cfg):
-    parts = (cfg.get("TV_IP") or "").split(".")
-    if len(parts) == 4 and all(p.isdigit() for p in parts):
-        return f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+    ip = cfg.get("TV_IP") or ""
+    if valid_ip(ip):
+        a, b, c, _ = ip.split(".")
+        return f"{a}.{b}.{c}.255"
     return "255.255.255.255"
 
 
 def wol(cfg):
     try:
         mac = [int(x, 16) for x in cfg["TV_MAC"].split(":")]
+        if len(mac) != 6:
+            raise ValueError("need 6 hex octets")
     except (KeyError, ValueError) as e:
         print(f"[sleepy] WOL failed: bad TV_MAC ({e})", flush=True)
         return
-    pkt = b"\xff" * 6 + bytes(mac) * 16
     ip = cfg.get("TV_IP") or ""
+    if ip and not valid_ip(ip):
+        print(f"[sleepy] WARNING: TV_IP looks invalid ({ip!r}) — broadcast only", flush=True)
+        ip = ""
+    pkt = b"\xff" * 6 + bytes(mac) * 16
     bcast = broadcast_ip(cfg)
     try:
         repeats = max(1, int(cfg.get("WOL_REPEATS", 3)))
@@ -70,8 +84,14 @@ def wol(cfg):
     try:
         for i in range(repeats):
             if ip:
-                s.sendto(pkt, (ip, 9))
-            s.sendto(pkt, (bcast, 9))
+                try:
+                    s.sendto(pkt, (ip, 9))
+                except OSError as e:
+                    print(f"[sleepy] WOL unicast send failed ({e})", flush=True)
+            try:
+                s.sendto(pkt, (bcast, 9))
+            except OSError as e:
+                print(f"[sleepy] WOL broadcast send failed ({e})", flush=True)
             if i < repeats - 1 and interval:
                 time.sleep(interval)
     finally:
@@ -93,8 +113,14 @@ def set_rgb(cfg, profile):
 
 
 def power_off(cfg):
-    bsc = os.path.join(VENV_BIN, "bscpylgtvcommand")
     ip = cfg.get("TV_IP") or ""
+    if not ip:
+        print("[sleepy] TV power_off skipped: TV_IP not set in sleepy.conf", flush=True)
+        return
+    if not valid_ip(ip):
+        print(f"[sleepy] TV power_off skipped: TV_IP looks invalid ({ip!r})", flush=True)
+        return
+    bsc = os.path.join(VENV_BIN, "bscpylgtvcommand")
     for attempt in (1, 2):
         try:
             r = subprocess.run([bsc, "-p", KEYFILE, ip, "power_off"],
@@ -140,7 +166,9 @@ def cmd_rgb(cfg, state):
 
 def cmd_test(cfg):
     print("== static checks ==")
-    print(f"  TV_IP            : {cfg.get('TV_IP') or 'MISSING'}")
+    ip = cfg.get("TV_IP") or ""
+    ip_note = "" if (not ip or valid_ip(ip)) else "   <-- INVALID (fix sleepy.conf)"
+    print(f"  TV_IP            : {ip or 'MISSING'}{ip_note}")
     print(f"  TV_MAC           : {cfg.get('TV_MAC') or 'MISSING'}")
     print(f"  openrgb          : {shutil.which(cfg.get('OPENRGB_BIN','openrgb')) or 'NOT FOUND'}")
     bsc = os.path.join(VENV_BIN, "bscpylgtvcommand")
@@ -153,11 +181,12 @@ def cmd_test(cfg):
 
 
 def cmd_detect(cfg):
+    ip = cfg.get("TV_IP") or ""
     print(f"INSTALL_PATH : {INSTALL_PATH}")
-    print(f"TV_IP        : {cfg.get('TV_IP')}")
+    print(f"TV_IP        : {ip or 'MISSING'}{'   <-- INVALID' if ip and not valid_ip(ip) else ''}")
     print(f"TV_MAC       : {cfg.get('TV_MAC')}")
     print(f"WOL          : {cfg.get('WOL_REPEATS')}x @ {cfg.get('WOL_INTERVAL_MS')}ms "
-          f"-> {cfg.get('TV_IP')}:9 + {broadcast_ip(cfg)}:9")
+          f"-> {ip or broadcast_ip(cfg)}:9 + {broadcast_ip(cfg)}:9")
     print(f"openrgb      : {shutil.which(cfg.get('OPENRGB_BIN','openrgb')) or 'NOT FOUND'}")
     print(f"RGB profiles : on={cfg.get('RGB_ON_PROFILE')}  off={cfg.get('RGB_OFF_PROFILE')}")
     bsc = os.path.join(VENV_BIN, "bscpylgtvcommand")

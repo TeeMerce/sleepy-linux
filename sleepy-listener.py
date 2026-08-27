@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""sleepy-listener.py — v3
-
-Watches GNOME's screen-lock state AND monitor power state, drives TV + RGB:
+"""sleepy-listener.py — v3.1
 
   ScreenSaver locked             -> off   (TV off + RGB off)
   ScreenSaver unlocked           -> on    (TV on  + RGB on)
@@ -10,12 +8,9 @@ Watches GNOME's screen-lock state AND monitor power state, drives TV + RGB:
       + still locked after GUARD -> off   (re-switch off if not logged in)
       + unlocked                 -> ignore
 
-- Event-driven (D-Bus signals), no polling.
-- Lock state via org.gnome.ScreenSaver.GetActive() (method, not the
-  IsLocked property — that doesn't exist on modern GNOME).
-- One-shot `openrgb --profile` (no background server needed).
-- TV on/off via sleepy-ctl (WOL + bscpylgtv power_off).
-- Never acts on the initial lock state.
+v3.1: lock state is detected by BOTH the ActiveChanged signal (instant)
+      AND a GetActive() poll (fallback) — so lock->off works even if the
+      D-Bus signal is missed on this GNOME. Verbose logging for diagnosis.
 """
 import os
 import subprocess
@@ -31,12 +26,12 @@ CONF = os.path.join(INSTALL_PATH, "sleepy.conf")
 
 
 def load_conf():
-    cfg = {"GUARD_SECONDS": 4.0}
+    cfg = {"GUARD_SECONDS": 4.0, "LOCK_POLL_SECONDS": 2.0}
     try:
         with open(CONF) as fh:
             for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
+                line = line.split("#", 1)[0].strip()   # v3.2: drop inline comments
+                if not line or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
                 k, v = k.strip(), v.strip().strip('"').strip("'")
@@ -63,7 +58,9 @@ def run_ctl(action):
     try:
         subprocess.run([CTL, action], timeout=90,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"[sleepy] -> {action}", flush=True)
+        print(f"[sleepy] -> {action} (ok)", flush=True)
+    except subprocess.TimeoutExpired:
+        print(f"[sleepy] -> {action} TIMED OUT", flush=True)
     except Exception as e:
         print(f"[sleepy] {action} failed: {e}", flush=True)
 
@@ -83,15 +80,23 @@ class Sleepy:
                 Gio.DBusCallFlags.NONE, -1, None,
             )
             return bool(res.unpack()[0])
-        except Exception:
+        except Exception as e:
+            print(f"[sleepy] GetActive error: {e}", flush=True)
             return None
 
-    def set_locked(self, locked):
+    def set_locked(self, locked, source="signal"):
         if locked == self.locked:
             return
         self.locked = locked
-        print(f"[sleepy] ScreenSaver {'locked' if locked else 'unlocked'}", flush=True)
+        print(f"[sleepy] ScreenSaver {'locked' if locked else 'unlocked'} (via {source})", flush=True)
         run_ctl("off" if locked else "on")
+
+    def poll_lock(self):
+        # Fallback: catch lock/unlock even if the ActiveChanged signal is missed.
+        state = self.get_locked()
+        if state is not None:
+            self.set_locked(state, source="poll")
+        return True  # keep the timeout alive
 
     def on_power_save(self, mode):
         if mode == 0:
@@ -115,7 +120,11 @@ class Sleepy:
         try:
             connection, sender, obj_path, iface, sig, params, user_data = args
             if sig == "ActiveChanged" and iface == "org.gnome.ScreenSaver":
-                self.set_locked(params.unpack()[0])
+                val = params.unpack()[0]
+                print(f"[sleepy] ActiveChanged signal: {val}", flush=True)
+                self.set_locked(val, source="signal")
+            else:
+                print(f"[sleepy] saver signal (ignored): {iface}.{sig}", flush=True)
         except Exception as e:
             print(f"[sleepy] saver error: {e}", flush=True)
 
@@ -126,18 +135,19 @@ class Sleepy:
                 prop_iface, changed, _ = params.unpack()
                 if prop_iface == "org.gnome.Mutter.DisplayConfig" and "PowerSaveMode" in changed:
                     self.on_power_save(changed["PowerSaveMode"])
+                else:
+                    print(f"[sleepy] props (ignored): {prop_iface} {changed}", flush=True)
         except Exception as e:
             print(f"[sleepy] props error: {e}", flush=True)
 
     def start(self):
         initial = self.get_locked()
         if initial is None:
-            print("[sleepy] FATAL: cannot read lock state "
-                  "(org.gnome.ScreenSaver missing?)", flush=True)
+            print("[sleepy] FATAL: cannot read lock state (org.gnome.ScreenSaver missing?)", flush=True)
             sys.exit(1)
         self.locked = initial  # baseline — never act on it
-        print(f"[sleepy] v3 started (initial={'locked' if initial else 'unlocked'}, "
-              f"guard={self.cfg['GUARD_SECONDS']}s)", flush=True)
+        print(f"[sleepy] v3.1 started (initial={'locked' if initial else 'unlocked'}, "
+              f"guard={self.cfg['GUARD_SECONDS']}s, lock_poll={self.cfg['LOCK_POLL_SECONDS']}s)", flush=True)
 
         self.bus.signal_subscribe(
             None, "org.gnome.ScreenSaver", "ActiveChanged",
@@ -149,6 +159,8 @@ class Sleepy:
             "/org/gnome/Mutter/DisplayConfig", None, Gio.DBusSignalFlags.NONE,
             self.on_props, None,
         )
+        # Fallback poller for lock state (robustness if the signal is missed).
+        GLib.timeout_add_seconds(int(self.cfg["LOCK_POLL_SECONDS"]), self.poll_lock)
 
 
 def main():
